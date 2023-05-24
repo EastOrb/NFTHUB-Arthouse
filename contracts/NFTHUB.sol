@@ -4,17 +4,21 @@ pragma solidity ^0.8.0;
 import "@openzeppelin/contracts/utils/Counters.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/interfaces/IERC20.sol";
 
-contract NFTHUB is ReentrancyGuard, ERC721URIStorage {
+contract NFTHUB is ReentrancyGuard, ERC721URIStorage, Ownable {
     using Counters for Counters.Counter;
     Counters.Counter private _tokenIds;
     Counters.Counter private _itemIds;
 
-    address payable owner;
-    uint256 listingPrice = 1;
+    address payable private _owner;
+    uint256 private _listingPrice = 1;
+    IERC20 private _celoUSD;
 
-    constructor() ERC721("NFTHUB", "NFTH") {
-        owner = payable(msg.sender);
+    constructor(address celoUSDAddress) ERC721("NFTHUB", "NFTH") {
+        _owner = payable(msg.sender);
+        _celoUSD = IERC20(celoUSDAddress);
     }
 
     struct Item {
@@ -30,71 +34,70 @@ contract NFTHUB is ReentrancyGuard, ERC721URIStorage {
 
     event ItemListed(uint256 indexed id, string tokenURI);
 
-    function listNFT(string memory tokenURI) public payable nonReentrant {
-        require(msg.value >= listingPrice, "Listing price not met");
+    modifier onlyOwnerOrApproved(address nftAddress, uint256 tokenId) {
+        require(
+            msg.sender == _owner || _isApprovedOrOwner(nftAddress, tokenId),
+            "Only owner or approved address can call this function"
+        );
+        _;
+    }
+
+    function _isApprovedOrOwner(address nftAddress, uint256 tokenId)
+        private
+        view
+        returns (bool)
+    {
+        return
+            _exists(tokenId) &&
+            (ERC721(nftAddress).ownerOf(tokenId) == msg.sender ||
+                ERC721(nftAddress).getApproved(tokenId) == msg.sender ||
+                ERC721(nftAddress).isApprovedForAll(
+                    ERC721(nftAddress).ownerOf(tokenId),
+                    msg.sender
+                ));
+    }
+
+    function listNFT(address nftAddress, uint256 tokenId, string memory tokenURI)
+        public
+        payable
+        nonReentrant
+    {
+        require(msg.value >= _listingPrice, "Listing price not met");
 
         _tokenIds.increment();
-        uint256 tokenId = _tokenIds.current();
+        uint256 newItemId = _itemIds.current();
 
         // Mint the NFT
-        _safeMint(msg.sender, tokenId);
-        _setTokenURI(tokenId, tokenURI);
-
-        // Create a new item
-        _itemIds.increment();
-        uint256 itemId = _itemIds.current();
+        ERC721(nftAddress).safeTransferFrom(msg.sender, address(this), tokenId);
+        _safeMint(address(this), newItemId);
+        _setTokenURI(newItemId, tokenURI);
 
         Item memory newItem = Item(
-            itemId,
+            newItemId,
             msg.sender,
-            address(this),
+            nftAddress,
             tokenId,
             tokenURI
         );
-        _idToItem[itemId] = newItem;
-        _itemIdsArray.push(itemId);
+        _idToItem[newItemId] = newItem;
+        _itemIdsArray.push(newItemId);
 
-        emit ItemListed(itemId, tokenURI);
-        payable(owner).transfer(listingPrice);
+        emit ItemListed(newItemId, tokenURI);
+        _owner.transfer(_listingPrice);
     }
 
-    function getListingPrice() public view returns (uint256) {
-        return listingPrice;
-    }
-
-    function setListingPrice(uint256 newPrice) public {
-        require(msg.sender == owner, "Only owner can set listing price");
-        listingPrice = newPrice;
-    }
-
-    function fetchItem(uint256 itemId)
+    function purchaseNFT(uint256 itemId)
         public
-        view
-        returns (
-            uint256,
-            address,
-            address,
-            uint256,
-            string memory
-        )
+        payable
+        nonReentrant
     {
         require(_idToItem[itemId].minter != address(0), "Item does not exist");
 
-        Item storage item = _idToItem[itemId];
-        string memory tokenURI = item.tokenURI;
+        Item memory item = _idToItem[itemId];
+        require(msg.value >= _listingPrice, "Listing price not met");
 
-        return (item.id, item.minter, item.nftAddress, item.tokenId, tokenURI);
-    }
+        // Transfer cUSD from buyer to seller
+        _celoUSD.transferFrom(msg.sender, item.minter, _listingPrice);
 
-    function getAllItems() public view returns (Item[] memory) {
-        Item[] memory items = new Item[](_itemIdsArray.length);
-
-        for (uint256 i = 0; i < _itemIdsArray.length; i++) {
-            uint256 itemId = _itemIdsArray[i];
-            Item storage item = _idToItem[itemId];
-            items[i] = item;
-        }
-
-        return items;
-    }
-}
+        // Transfer NFT from contract to buyer
+        ERC721(item.nftAddress).safe
